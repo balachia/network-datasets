@@ -12,7 +12,7 @@ dat <- fread(attr.file, skip=18, col.names=cols)
 
 # see codebook in readme
 dat[, adoption_date := as.numeric(adoption_date)]
-dat[adoption_date == 18, adoption_date := Inf]
+#dat[adoption_date == 18, adoption_date := Inf]
 dat[adoption_date == 98, adoption_date := NA]
 dat[adoption_date == 99, adoption_date := NA]
 

@@ -1,0 +1,264 @@
+library(data.table)
+library(igraph)
+library(matrixStats)
+
+data.dir <- '../../processed/'
+
+g <- read_graph(sprintf('%s/ckm.graphml', data.dir), 'graphml')
+
+dat <- fread(sprintf('%s/attributes.csv', data.dir))
+
+# extract cities
+city.idx <- lapply(sort(unique(dat$city)), function(i) which(dat$city==i))
+
+# ensure that dat matches city.idx order
+dat <- dat[order(do.call(c, city.idx))]
+
+# extract adjacency matrices
+net.names <- c('advice', 'discussion', 'friend')
+names(net.names) <- net.names
+
+nets <- lapply(net.names, function(nm) {
+        #read_graph(sprintf('%s/%s.csv', data.dir, nm), 'edgelist')
+        mat <- as_adj(g, attr=nm, sparse=FALSE)
+        mat[is.nan(mat)] <- 0
+        mat
+    })
+
+#net.mats <- lapply(nets, as_adj, sparse=FALSE)
+
+############################################################
+# basic matrices
+
+# raw 'choice' network matrix
+net.mat <- 1*(nets$advice | nets$discussion)
+net.mats <- lapply(city.idx, function(idx) net.mat[idx, idx])
+
+# path distance matrix??
+path.mats <- lapply(net.mats, function(A) {
+        g1 <- graph_from_adjacency_matrix(A)
+        path.mat <- 1 / distances(g1, mode='out')
+        # avoid Infs in diagonal: they break row sums later on
+        diag(path.mat) <- 0
+        path.mat
+    })
+
+############################################################
+# structural equivalence definitions
+
+#' pairwise distance matrix for vectors
+#'
+#' for two matrices, A(m x k) + B(n x k), implements \sum_{i,j} \sum_k (a_ik - b_jk)^2
+#' via (a_ik - b_jk)^2 = a_ik ^2 + b_jk^2 - 2*a_ik*b_jk
+vectorized_pdist <- function(A,B) {
+    an = apply(A, 1, function(rvec) crossprod(rvec,rvec))
+    bn = apply(B, 1, function(rvec) crossprod(rvec,rvec))
+ 
+    m = nrow(A)
+    n = nrow(B)
+ 
+    tmp = matrix(rep(an, n), nrow=m) 
+    tmp = tmp +  matrix(rep(bn, m), nrow=m, byrow=TRUE)
+    tmp - 2 * tcrossprod(A,B)
+}
+
+row_distances <- function(A) vectorized_pdist(A,A)
+
+structural.equivalence <- function(A) {
+    res <- ( (A-t(A))^2 + row_distances(A) + row_distances(t(A)) )
+    # numerical errors can produce negative numbers
+    #print(sum(res < 0))
+    #print(res[res < 0])
+    res[res<0] <- 0
+    sqrt(res)
+}
+
+# structural equivalence based on path distance matrix (p1330)
+# except these have to be calculated within city
+se.mats <- lapply(path.mats, structural.equivalence)
+
+# some kind of bizarro transposition happening? (p1331)
+# w_ji = (dmax_j - d_ij)^v / \sum_k (dmax_j - d_kj)^v
+# so, start with d_ij, subtract from row max, then transpose and normalize by row sum??
+sedist.mats <- lapply(se.mats, function(se.mat) t(rowMaxs(se.mat) - se.mat))
+
+############################################################
+# norm definitions
+
+# general norm function (equation 2, p1296)
+Wmat <- function(A, v=Inf) {
+    Ap <- A^v
+    Ar <- rowSums2(Ap)
+    Ar[Ar==0] <- 1
+    Ap/Ar
+}
+
+cohesion.raws <- lapply(net.mats, Wmat, v=1)
+
+############################################################
+# adoption imputation (p1332)
+
+# given focal actor j, return possible imputed adoptions for all other actors
+adopt.impute <- function(W, adopt, j) {
+    # eliminate actors with missing adopt and focal actor
+    bad.adopt <- c(j, which(is.na(adopt)))
+    good.adopt <- adopt[-bad.adopt]
+    # find best matches
+    apply(rowRanks(-W[, -bad.adopt], ties.method='min'), 1, function(ranks) {
+        good.adopt[ranks==1]
+    })
+}
+
+# creates imputed adoption vector for a single actor
+collapse.impute <- function(adopt, imputations, impute.random=TRUE) {
+    f.impute <- if(impute.random) function(x) sample(x, 1) else mean
+    imputed <- sapply(imputations, f.impute)
+    adopt1 <- adopt
+    adopt1[is.na(adopt)] <- imputed[is.na(adopt)]
+    adopt1
+}
+
+# builds entire norm vector
+build.norm <- function(W, adopt, ...) {
+    sapply(seq_along(adopt), function(i) {
+        imps <- adopt.impute(W, adopt, i)
+        adopt.imp <- collapse.impute(adopt, imps, ...)
+        crossprod(W[i,], adopt.imp)
+    })
+}
+
+standardize <- function(x) {
+    (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+}
+
+############################################################
+# lumping function
+
+lump <- function(x) {
+    ranks <- rank(x, ties.method='min')
+    ranks <- ranks/sum(!is.na(x))
+    max.ranks <- ranks
+    for(ux in unique(x)) {
+        max.ranks[which(x==ux)] <- max(ranks[which(x==ux)])
+    }
+    max.ranks[is.na(x)] <- max(ranks[is.na(x)])
+    cat.levels <- c(1/4, 1/3, 1/2, 2/3, 3/4, 1)
+    cats <- 1                           # 1 <= 1/4
+    for(lv in cat.levels) cats <- cats + 1*(max.ranks>lv)
+    cats[cats>6] <- NA
+    cats
+}
+
+############################################################
+# table 1
+
+adopt.std <- standardize(dat$adoption_date)
+
+# row 1, cohesion
+# per appendix, optimal cohesion has v=Inf, i.e. using original net.mats data
+cohWs <- lapply(net.mats, Wmat, v=1)
+coh.norms <- lapply(1:4, function(id) {
+        adopt <- dat[city.idx[[id]], adoption_date]
+        norm <- build.norm(cohWs[[id]], adopt, impute.random=TRUE)
+    })
+coh.norm <- do.call(c, coh.norms)
+# standardize across all rows??
+coh.norm <- standardize(coh.norm)
+
+summary(t1r1.coh <- lm(adopt.std ~ coh.norm))
+
+# row 1, structural equivalence
+se.best.v <- c(Peoria=10, Bloomington=12, Quincy=6, Galesburg=2)
+seWs <- lapply(1:4, function(i) {
+        Wmat(sedist.mats[[i]], v=se.best.v[i])
+    })
+se.norms <- lapply(1:4, function(id) {
+        adopt <- dat[city.idx[[id]], adoption_date]
+        norm <- build.norm(seWs[[id]], adopt, impute.random=TRUE)
+    })
+se.norm <- do.call(c, se.norms)
+# standardize across all rows??
+se.norm <- standardize(se.norm)
+
+summary(t1r1.se <- lm(adopt.std ~ se.norm))
+
+#-----------------------------------------------------------
+# copy tables
+
+aggs <- list(1:2, 3:5, 6)
+
+se.table2 <- matrix(c(
+    7, 3, 6, 4, 2, 7,
+    3, 5, 2, 1, 0, 1,
+    6, 3, 5, 6, 0, 1,
+    10, 0, 3, 1, 1, 6,
+    4, 0, 1, 0, 1, 4,
+    0, 0, 5, 9, 6, 11), nrow=6, byrow=TRUE)
+
+coh.table2 <- matrix(c(
+    5, 3, 4, 2, 5, 8,
+    3, 1, 1, 3, 2, 2,
+    5, 2, 4, 3, 1, 5,
+    8, 4, 3, 3, 2, 1,
+    4, 0, 0, 0, 0, 5,
+    6, 1, 6, 6, 3, 6),nrow=6, byrow=TRUE)
+
+se.table2.agg <- sapply(aggs, function(is) {
+        sapply(aggs, function(js) sum(se.table2[js, is]))
+    })
+
+coh.table2.agg <- sapply(aggs, function(is) {
+        sapply(aggs, function(js) sum(coh.table2[js, is]))
+    })
+
+chisq.test(se.table2)
+chisq.test(coh.table2)
+
+chisq.test(se.table2.agg)
+chisq.test(coh.table2.agg)
+
+#-----------------------------------------------------------
+
+se.cats <- lapply(1:4, function(i) {
+        x <- se.norms[[i]]
+        x[is.na(dat[city==i, adoption_date])] <- NA
+        lump(x)
+    })
+se.cat <- do.call(c, se.cats)
+
+coh.cats <- lapply(1:4, function(i) {
+        x <- coh.norms[[i]]
+        x[is.na(dat[city==i, adoption_date])] <- NA
+        lump(x)
+    })
+coh.cat <- do.call(c, coh.cats)
+
+dat[, cat := lump(adoption_date), by=city]
+
+se.table <- table(dat$cat, se.cat)
+coh.table <- table(dat$cat, coh.cat)
+
+se.table.agg <- sapply(aggs, function(is) {
+        sapply(aggs, function(js) sum(se.table[js, is]))
+    })
+
+coh.table.agg <- sapply(aggs, function(is) {
+        sapply(aggs, function(js) sum(coh.table[js, is]))
+    })
+
+chisq.test(se.table)
+chisq.test(coh.table)
+
+chisq.test(se.table.agg)
+chisq.test(coh.table.agg)
+
+
+############################################################
+# table 5
+
+# table 5 replication contingent on variables in table 4:
+# belief in science: unavailable?
+# professional age: available
+# many journal subscriptions: available
+# prescription-prone: unavailable
+# detail-man: unavailable
